@@ -319,6 +319,26 @@ export interface LLM {
   dispose(): Promise<void>;
 }
 
+/**
+ * Full LLM engine interface used by QMD internals.
+ * Extends the base LLM interface with tokenization, batch embedding,
+ * and resource management methods needed by store.ts and the session layer.
+ *
+ * Implemented by both LlamaCpp (local) and RemoteLLM (remote HTTP).
+ */
+export interface LLMEngine extends LLM {
+  /** Tokenize text into token IDs (opaque numbers) */
+  tokenize(text: string): Promise<readonly any[]>;
+  /** Detokenize token IDs back to text */
+  detokenize(tokens: readonly any[]): Promise<string>;
+  /** Count tokens in text */
+  countTokens(text: string): Promise<number>;
+  /** Batch embed multiple texts efficiently */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  /** Unload idle resources (contexts) to free memory */
+  unloadIdleResources(): Promise<void>;
+}
+
 // =============================================================================
 // node-llama-cpp Implementation
 // =============================================================================
@@ -956,11 +976,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLMEngine;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLMEngine) {
     this.llm = llm;
   }
 
@@ -996,7 +1016,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLLMEngine(): LLMEngine {
     return this.llm;
   }
 }
@@ -1099,18 +1119,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLLMEngine().embed(text, options));
   }
 
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts));
+    return this.withOperation(() => this.manager.getLLMEngine().embedBatch(texts));
   }
 
   async expandQuery(
     query: string,
     options?: { context?: string; includeLexical?: boolean }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLLMEngine().expandQuery(query, options));
   }
 
   async rerank(
@@ -1118,7 +1138,7 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLLMEngine().rerank(query, documents, options));
   }
 }
 
@@ -1130,7 +1150,7 @@ let defaultSessionManager: LLMSessionManager | null = null;
  */
 function getSessionManager(): LLMSessionManager {
   const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+  if (!defaultSessionManager || defaultSessionManager.getLLMEngine() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
   return defaultSessionManager;
@@ -1174,35 +1194,61 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for default LLM instance (local or remote)
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLLMEngine: LLMEngine | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Check if remote LLM is configured via environment variables.
+ * Returns the config if any QMD_*_URL env vars are set, null otherwise.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
-  if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+export function getRemoteLLMConfig(): { embedUrl?: string; generateUrl?: string; rerankUrl?: string } | null {
+  const embedUrl = process.env.QMD_EMBED_URL;
+  const generateUrl = process.env.QMD_GENERATE_URL;
+  const rerankUrl = process.env.QMD_RERANK_URL;
+
+  if (embedUrl || generateUrl || rerankUrl) {
+    return { embedUrl, generateUrl, rerankUrl };
   }
-  return defaultLlamaCpp;
+  return null;
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing)
+ * Get the default LLM engine (creates one if needed).
+ *
+ * If QMD_EMBED_URL, QMD_GENERATE_URL, or QMD_RERANK_URL environment variables
+ * are set, returns a RemoteLLM that calls external llama.cpp server(s) via HTTP.
+ * Otherwise returns a local LlamaCpp instance using node-llama-cpp.
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
-  defaultLlamaCpp = llm;
+export function getDefaultLlamaCpp(): LLMEngine {
+  if (!defaultLLMEngine) {
+    const remoteConfig = getRemoteLLMConfig();
+    if (remoteConfig) {
+      // Lazy import to avoid pulling in remote-llm when not needed
+      const { RemoteLLM } = require("./remote-llm");
+      defaultLLMEngine = new RemoteLLM(remoteConfig);
+    } else {
+      defaultLLMEngine = new LlamaCpp();
+    }
+  }
+  return defaultLLMEngine!;
 }
 
 /**
- * Dispose the default LlamaCpp instance if it exists.
+ * Set a custom default LLM engine (useful for testing)
+ */
+export function setDefaultLlamaCpp(llm: LLMEngine | null): void {
+  defaultLLMEngine = llm;
+}
+
+/**
+ * Dispose the default LLM engine if it exists.
  * Call this before process exit to prevent NAPI crashes.
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
-  if (defaultLlamaCpp) {
-    await defaultLlamaCpp.dispose();
-    defaultLlamaCpp = null;
+  if (defaultLLMEngine) {
+    await defaultLLMEngine.dispose();
+    defaultLLMEngine = null;
   }
 }

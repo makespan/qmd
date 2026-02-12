@@ -479,6 +479,9 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_EMBED_URL` | *(local)* | Remote embedding server URL (see [Remote Inference](#remote-inference-multi-user--docker)) |
+| `QMD_GENERATE_URL` | *(local)* | Remote query expansion server URL |
+| `QMD_RERANK_URL` | *(local)* | Remote reranking server URL |
 
 ## How It Works
 
@@ -576,6 +579,125 @@ Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross
 ### Qwen3 (Query Expansion)
 
 Used for generating query variations via `LlamaChatSession`.
+
+## Remote Inference (Multi-User / Docker)
+
+By default, QMD loads models in-process using node-llama-cpp. For **multi-user deployments** where you want to share GPU resources, you can run the models as separate [llama.cpp server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) instances and point QMD at them via environment variables.
+
+This lets multiple QMD instances (each with their own index/data) share a single set of model servers, avoiding redundant VRAM usage.
+
+### Architecture
+
+```
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ qmd (alice)  │  │ qmd (bob)    │  │ qmd (carol)  │
+│ own SQLite   │  │ own SQLite   │  │ own SQLite   │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       └────────────┬────┴─────────────────┘
+                    ▼
+    ┌─────────────────────────────────┐
+    │  Shared llama.cpp servers (1×GPU)│
+    │  :8081 embedding                │
+    │  :8082 query expansion          │
+    │  :8083 reranking                │
+    └─────────────────────────────────┘
+```
+
+### Setup
+
+**1. Start llama.cpp servers** (one per model):
+
+```sh
+# Embedding server
+llama-server \
+  --model embeddinggemma-300M-Q8_0.gguf \
+  --embedding --port 8081
+
+# Query expansion server
+llama-server \
+  --model qmd-query-expansion-1.7B-q4_k_m.gguf \
+  --port 8082
+
+# Reranking server
+llama-server \
+  --model qwen3-reranker-0.6b-q8_0.gguf \
+  --reranking --port 8083
+```
+
+**2. Configure QMD** via environment variables:
+
+```sh
+export QMD_EMBED_URL=http://localhost:8081
+export QMD_GENERATE_URL=http://localhost:8082
+export QMD_RERANK_URL=http://localhost:8083
+```
+
+That's it — QMD will now call the remote servers instead of loading models locally. All commands (`embed`, `search`, `vsearch`, `query`) work identically.
+
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `QMD_EMBED_URL` | URL of llama.cpp server loaded with the embedding model |
+| `QMD_GENERATE_URL` | URL of llama.cpp server loaded with the query expansion model |
+| `QMD_RERANK_URL` | URL of llama.cpp server loaded with the reranking model |
+
+Set any combination — only the configured capabilities use remote inference. For example, setting only `QMD_EMBED_URL` uses remote embeddings but local reranking and query expansion.
+
+### Docker Compose Example
+
+```yaml
+services:
+  embed-server:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: >
+      --model /models/embeddinggemma-300M-Q8_0.gguf
+      --embedding --port 8080 --host 0.0.0.0
+    volumes:
+      - ./models:/models
+    ports:
+      - "8081:8080"
+
+  generate-server:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: >
+      --model /models/qmd-query-expansion-1.7B-q4_k_m.gguf
+      --port 8080 --host 0.0.0.0
+    volumes:
+      - ./models:/models
+    ports:
+      - "8082:8080"
+
+  rerank-server:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: >
+      --model /models/qwen3-reranker-0.6b-q8_0.gguf
+      --reranking --port 8080 --host 0.0.0.0
+    volumes:
+      - ./models:/models
+    ports:
+      - "8083:8080"
+
+  qmd:
+    build: .
+    environment:
+      - QMD_EMBED_URL=http://embed-server:8080
+      - QMD_GENERATE_URL=http://generate-server:8080
+      - QMD_RERANK_URL=http://rerank-server:8080
+    volumes:
+      - ./data:/data  # per-user index via --index
+```
+
+### API Compatibility
+
+The remote backend uses standard llama.cpp server endpoints:
+- `POST /v1/embeddings` — OpenAI-compatible embeddings
+- `POST /v1/chat/completions` — Chat completions with GBNF grammar support
+- `POST /v1/rerank` — Jina/Cohere-compatible reranking
+- `POST /tokenize` / `POST /detokenize` — Token operations
+
+Any server implementing these endpoints (vLLM, Ollama, etc.) should work.
 
 ## License
 

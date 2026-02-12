@@ -16,7 +16,7 @@ import { Glob } from "bun";
 import { realpathSync, statSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
-  LlamaCpp,
+  type LLMEngine,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
