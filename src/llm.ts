@@ -25,16 +25,22 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
 /**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma.
+ * When QMD_EMBED_FORMAT=raw, returns the query unmodified.
  */
 export function formatQueryForEmbedding(query: string): string {
+  if (isRawEmbedFormat()) return query;
   return `task: search result | query: ${query}`;
 }
 
 /**
  * Format a document for embedding.
  * Uses nomic-style format with title and text fields.
+ * When QMD_EMBED_FORMAT=raw, returns plain text (with title prefix if provided).
  */
 export function formatDocForEmbedding(text: string, title?: string): string {
+  if (isRawEmbedFormat()) {
+    return title ? `${title}\n\n${text}` : text;
+  }
   return `title: ${title || "none"} | text: ${text}`;
 }
 
@@ -337,6 +343,12 @@ export interface LLMEngine extends LLM {
   embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
   /** Unload idle resources (contexts) to free memory */
   unloadIdleResources(): Promise<void>;
+  /**
+   * Whether the engine has a real tokenizer (true for local LlamaCpp and llama.cpp server).
+   * When false, tokenize/detokenize use approximations and callers should use
+   * character-based chunking instead of token-based chunking.
+   */
+  readonly hasNativeTokenizer: boolean;
 }
 
 // =============================================================================
@@ -398,6 +410,8 @@ export class LlamaCpp implements LLM {
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
+  /** LlamaCpp always has a real tokenizer */
+  readonly hasNativeTokenizer = true;
 
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
@@ -1201,31 +1215,46 @@ let defaultLLMEngine: LLMEngine | null = null;
 
 /**
  * Check if remote LLM is configured via environment variables.
- * Returns the config if any QMD_*_URL env vars are set, null otherwise.
+ * Returns the full config if any QMD_*_URL env vars are set, null otherwise.
  */
-export function getRemoteLLMConfig(): { embedUrl?: string; generateUrl?: string; rerankUrl?: string } | null {
+export function getRemoteLLMConfig(): RemoteLLMConfigType | null {
   const embedUrl = process.env.QMD_EMBED_URL;
   const generateUrl = process.env.QMD_GENERATE_URL;
   const rerankUrl = process.env.QMD_RERANK_URL;
 
   if (embedUrl || generateUrl || rerankUrl) {
-    return { embedUrl, generateUrl, rerankUrl };
+    // Lazy import to get configFromEnv
+    const { configFromEnv } = require("./remote-llm");
+    return configFromEnv();
   }
   return null;
 }
+
+// Forward-declared type to avoid importing remote-llm at top level
+type RemoteLLMConfigType = {
+  embedUrl?: string;
+  embedApiKey?: string;
+  embedModel?: string;
+  embedFormat?: "embeddinggemma" | "raw";
+  generateUrl?: string;
+  generateApiKey?: string;
+  generateModel?: string;
+  rerankUrl?: string;
+  rerankApiKey?: string;
+  rerankModel?: string;
+};
 
 /**
  * Get the default LLM engine (creates one if needed).
  *
  * If QMD_EMBED_URL, QMD_GENERATE_URL, or QMD_RERANK_URL environment variables
- * are set, returns a RemoteLLM that calls external llama.cpp server(s) via HTTP.
+ * are set, returns a RemoteLLM that calls external server(s) via HTTP.
  * Otherwise returns a local LlamaCpp instance using node-llama-cpp.
  */
 export function getDefaultLlamaCpp(): LLMEngine {
   if (!defaultLLMEngine) {
     const remoteConfig = getRemoteLLMConfig();
     if (remoteConfig) {
-      // Lazy import to avoid pulling in remote-llm when not needed
       const { RemoteLLM } = require("./remote-llm");
       defaultLLMEngine = new RemoteLLM(remoteConfig);
     } else {
@@ -1233,6 +1262,16 @@ export function getDefaultLlamaCpp(): LLMEngine {
     }
   }
   return defaultLLMEngine!;
+}
+
+/**
+ * Check if the default LLM engine uses raw embedding format (no model-specific prefixes).
+ * When true, formatQueryForEmbedding and formatDocForEmbedding return text unmodified.
+ *
+ * This checks the environment variable directly to avoid triggering engine creation.
+ */
+export function isRawEmbedFormat(): boolean {
+  return process.env.QMD_EMBED_FORMAT === "raw";
 }
 
 /**

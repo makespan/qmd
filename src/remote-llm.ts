@@ -1,18 +1,35 @@
 /**
- * remote-llm.ts - Remote LLM backend for QMD using llama.cpp server HTTP API
+ * remote-llm.ts - Remote LLM backend for QMD
  *
- * Enables sharing model inference across multiple QMD instances by calling
- * external llama.cpp server(s) instead of loading models in-process.
+ * Calls external HTTP API servers instead of loading models in-process.
+ * Works with llama.cpp server, OpenAI API, and any OpenAI-compatible service.
  *
  * Configure via environment variables:
- *   QMD_EMBED_URL    - Embedding server (e.g., http://localhost:8081)
- *   QMD_GENERATE_URL - Generation server (e.g., http://localhost:8082)
- *   QMD_RERANK_URL   - Reranking server (e.g., http://localhost:8083)
+ *   QMD_EMBED_URL       - Embedding server URL
+ *   QMD_EMBED_API_KEY   - API key for embedding server
+ *   QMD_EMBED_MODEL     - Model name to send in requests
+ *   QMD_EMBED_FORMAT    - "embeddinggemma" (default) or "raw"
+ *   QMD_GENERATE_URL    - Generation server URL
+ *   QMD_GENERATE_API_KEY - API key for generation server
+ *   QMD_GENERATE_MODEL  - Model name for generation
+ *   QMD_RERANK_URL      - Reranking server URL
+ *   QMD_RERANK_API_KEY  - API key for reranking server
+ *   QMD_RERANK_MODEL    - Model name for reranking
  *
- * Each URL points to a llama.cpp server instance loaded with the appropriate model:
- *   - Embedding:  llama-server -m embeddinggemma-300M-Q8_0.gguf --embedding --port 8081
- *   - Generation: llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf --port 8082
- *   - Reranking:  llama-server -m qwen3-reranker-0.6b-q8_0.gguf --reranking --port 8083
+ * Examples:
+ *   # llama.cpp server (no auth needed)
+ *   QMD_EMBED_URL=http://localhost:8081
+ *
+ *   # OpenAI
+ *   QMD_EMBED_URL=https://api.openai.com
+ *   QMD_EMBED_API_KEY=sk-...
+ *   QMD_EMBED_MODEL=text-embedding-3-small
+ *   QMD_EMBED_FORMAT=raw
+ *
+ *   # Any OpenAI-compatible service (Ollama, vLLM, Together, etc.)
+ *   QMD_EMBED_URL=http://localhost:11434
+ *   QMD_EMBED_MODEL=nomic-embed-text
+ *   QMD_EMBED_FORMAT=raw
  */
 
 import type {
@@ -32,26 +49,107 @@ import type {
 
 export type RemoteLLMConfig = {
   embedUrl?: string;
+  embedApiKey?: string;
+  embedModel?: string;
+  embedFormat?: "embeddinggemma" | "raw";
   generateUrl?: string;
+  generateApiKey?: string;
+  generateModel?: string;
   rerankUrl?: string;
+  rerankApiKey?: string;
+  rerankModel?: string;
 };
 
 /**
- * Remote LLM implementation that calls llama.cpp server(s) via HTTP.
+ * Build a RemoteLLMConfig from environment variables.
+ */
+export function configFromEnv(): RemoteLLMConfig {
+  return {
+    embedUrl: process.env.QMD_EMBED_URL,
+    embedApiKey: process.env.QMD_EMBED_API_KEY,
+    embedModel: process.env.QMD_EMBED_MODEL,
+    embedFormat: (process.env.QMD_EMBED_FORMAT as "embeddinggemma" | "raw") || undefined,
+    generateUrl: process.env.QMD_GENERATE_URL,
+    generateApiKey: process.env.QMD_GENERATE_API_KEY,
+    generateModel: process.env.QMD_GENERATE_MODEL,
+    rerankUrl: process.env.QMD_RERANK_URL,
+    rerankApiKey: process.env.QMD_RERANK_API_KEY,
+    rerankModel: process.env.QMD_RERANK_MODEL,
+  };
+}
+
+// =============================================================================
+// Approximate tokenizer for APIs without /tokenize endpoint
+// =============================================================================
+
+/**
+ * Simple token approximation: ~4 characters per token.
+ * Used as fallback when the remote server doesn't support /tokenize.
+ * Good enough for chunking purposes.
+ */
+function approxTokenize(text: string): number[] {
+  const CHARS_PER_TOKEN = 4;
+  const count = Math.max(1, Math.ceil(text.length / CHARS_PER_TOKEN));
+  return Array.from({ length: count }, (_, i) => i);
+}
+
+function approxDetokenize(tokens: readonly any[], originalLength?: number): string {
+  // We can't truly detokenize without the model, but for chunking
+  // the caller uses slice on the original text anyway
+  return `[${tokens.length} tokens]`;
+}
+
+/**
+ * Remote LLM implementation that calls HTTP API servers.
  *
- * Implements the same LLMEngine interface as LlamaCpp, enabling transparent
- * substitution when QMD_*_URL environment variables are set.
+ * Compatible with:
+ * - llama.cpp server (full support including tokenize/rerank)
+ * - OpenAI API (embeddings + chat completions)
+ * - Any OpenAI-compatible service (Ollama, vLLM, Together, Groq, etc.)
  */
 export class RemoteLLM implements LLMEngine {
   private embedUrl: string;
+  private embedApiKey: string;
+  private embedModel: string;
+  private embedFormat: "embeddinggemma" | "raw";
   private generateUrl: string;
+  private generateApiKey: string;
+  private generateModel: string;
   private rerankUrl: string;
+  private rerankApiKey: string;
+  private rerankModel: string;
   private disposed = false;
+
+  // Whether the embed server supports /tokenize (auto-detected on first call)
+  private _tokenizeSupported: boolean | null = null;
 
   constructor(config: RemoteLLMConfig) {
     this.embedUrl = (config.embedUrl || "").replace(/\/+$/, "");
+    this.embedApiKey = config.embedApiKey || "";
+    this.embedModel = config.embedModel || "";
+    this.embedFormat = config.embedFormat || "embeddinggemma";
     this.generateUrl = (config.generateUrl || "").replace(/\/+$/, "");
+    this.generateApiKey = config.generateApiKey || "";
+    this.generateModel = config.generateModel || "";
     this.rerankUrl = (config.rerankUrl || "").replace(/\/+$/, "");
+    this.rerankApiKey = config.rerankApiKey || "";
+    this.rerankModel = config.rerankModel || "";
+  }
+
+  /**
+   * Whether this instance uses raw embedding format (no embeddinggemma prefixes).
+   */
+  get isRawEmbedFormat(): boolean {
+    return this.embedFormat === "raw";
+  }
+
+  /**
+   * Whether the remote server has a real tokenizer.
+   * Auto-detected on first tokenize call. Before detection, returns false
+   * so callers use character-based chunking as the safe default.
+   */
+  get hasNativeTokenizer(): boolean {
+    return this._tokenizeSupported === true;
   }
 
   // ===========================================================================
@@ -67,10 +165,24 @@ export class RemoteLLM implements LLMEngine {
     return url;
   }
 
-  private async fetchJSON(url: string, body: object): Promise<any> {
+  private buildHeaders(apiKey: string): Record<string, string> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (apiKey) {
+      headers["Authorization"] = `Bearer ${apiKey}`;
+    }
+    return headers;
+  }
+
+  private async fetchJSON(
+    url: string,
+    body: object,
+    apiKey: string = ""
+  ): Promise<any> {
     const resp = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: this.buildHeaders(apiKey),
       body: JSON.stringify(body),
     });
     if (!resp.ok) {
@@ -81,21 +193,55 @@ export class RemoteLLM implements LLMEngine {
   }
 
   // ===========================================================================
-  // Tokenization (via embedding server)
+  // Tokenization
   // ===========================================================================
 
+  /**
+   * Tokenize text. Tries the server's /tokenize endpoint first (llama.cpp),
+   * falls back to character-based approximation (OpenAI, etc.).
+   */
   async tokenize(text: string): Promise<readonly number[]> {
     const url = this.requireUrl(this.embedUrl, "embed");
-    const data = await this.fetchJSON(`${url}/tokenize`, { content: text });
-    return data.tokens as number[];
+
+    // If we already know tokenize isn't supported, use approximation
+    if (this._tokenizeSupported === false) {
+      return approxTokenize(text);
+    }
+
+    try {
+      const data = await this.fetchJSON(
+        `${url}/tokenize`,
+        { content: text },
+        this.embedApiKey
+      );
+      this._tokenizeSupported = true;
+      return data.tokens as number[];
+    } catch (error) {
+      // Server doesn't support /tokenize — use approximation
+      this._tokenizeSupported = false;
+      return approxTokenize(text);
+    }
   }
 
   async detokenize(tokens: readonly any[]): Promise<string> {
     const url = this.requireUrl(this.embedUrl, "embed");
-    const data = await this.fetchJSON(`${url}/detokenize`, {
-      tokens: Array.from(tokens),
-    });
-    return data.content as string;
+
+    if (this._tokenizeSupported === false) {
+      return approxDetokenize(tokens);
+    }
+
+    try {
+      const data = await this.fetchJSON(
+        `${url}/detokenize`,
+        { tokens: Array.from(tokens) },
+        this.embedApiKey
+      );
+      this._tokenizeSupported = true;
+      return data.content as string;
+    } catch {
+      this._tokenizeSupported = false;
+      return approxDetokenize(tokens);
+    }
   }
 
   async countTokens(text: string): Promise<number> {
@@ -107,15 +253,23 @@ export class RemoteLLM implements LLMEngine {
   // Embeddings
   // ===========================================================================
 
-  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+  async embed(
+    text: string,
+    options: EmbedOptions = {}
+  ): Promise<EmbeddingResult | null> {
     try {
       const url = this.requireUrl(this.embedUrl, "embed");
-      const data = await this.fetchJSON(`${url}/v1/embeddings`, {
-        input: [text],
-      });
+      const body: any = { input: [text] };
+      if (this.embedModel) body.model = this.embedModel;
+
+      const data = await this.fetchJSON(
+        `${url}/v1/embeddings`,
+        body,
+        this.embedApiKey
+      );
       return {
         embedding: data.data[0].embedding,
-        model: "remote:" + this.embedUrl,
+        model: this.embedModel || "remote:" + this.embedUrl,
       };
     } catch (error) {
       console.error("Remote embedding error:", error);
@@ -127,17 +281,21 @@ export class RemoteLLM implements LLMEngine {
     if (texts.length === 0) return [];
     try {
       const url = this.requireUrl(this.embedUrl, "embed");
-      // llama.cpp server supports batched input natively
-      const data = await this.fetchJSON(`${url}/v1/embeddings`, {
-        input: texts,
-      });
+      const body: any = { input: texts };
+      if (this.embedModel) body.model = this.embedModel;
+
+      const data = await this.fetchJSON(
+        `${url}/v1/embeddings`,
+        body,
+        this.embedApiKey
+      );
       // Sort by index to ensure correct ordering
       const sorted = (data.data as any[]).sort(
         (a: any, b: any) => a.index - b.index
       );
       return sorted.map((d: any) => ({
         embedding: d.embedding,
-        model: "remote:" + this.embedUrl,
+        model: this.embedModel || "remote:" + this.embedUrl,
       }));
     } catch (error) {
       console.error("Remote batch embedding error:", error);
@@ -155,16 +313,22 @@ export class RemoteLLM implements LLMEngine {
   ): Promise<GenerateResult | null> {
     try {
       const url = this.requireUrl(this.generateUrl, "generate");
-      const data = await this.fetchJSON(`${url}/v1/chat/completions`, {
+      const body: any = {
         messages: [{ role: "user", content: prompt }],
         max_tokens: options.maxTokens ?? 150,
         temperature: options.temperature ?? 0.7,
-        top_k: 20,
         top_p: 0.8,
-      });
+      };
+      if (this.generateModel) body.model = this.generateModel;
+
+      const data = await this.fetchJSON(
+        `${url}/v1/chat/completions`,
+        body,
+        this.generateApiKey
+      );
       return {
         text: data.choices[0].message.content,
-        model: "remote:" + this.generateUrl,
+        model: this.generateModel || "remote:" + this.generateUrl,
         done: true,
       };
     } catch (error) {
@@ -193,17 +357,26 @@ content ::= [^\\n]+
 
     try {
       const url = this.requireUrl(this.generateUrl, "generate");
-      const data = await this.fetchJSON(`${url}/v1/chat/completions`, {
+      const body: any = {
         messages: [{ role: "user", content: prompt }],
-        grammar: RemoteLLM.EXPANSION_GRAMMAR,
         max_tokens: 600,
         temperature: 0.7,
-        top_k: 20,
         top_p: 0.8,
-        repeat_penalty: 1.0,
-        presence_penalty: 0.5,
-        repeat_last_n: 64,
-      });
+      };
+      if (this.generateModel) body.model = this.generateModel;
+
+      // Only include grammar for llama.cpp compatible servers
+      // OpenAI doesn't support GBNF grammar, so we'll parse best-effort
+      body.grammar = RemoteLLM.EXPANSION_GRAMMAR;
+      body.repeat_penalty = 1.0;
+      body.presence_penalty = 0.5;
+      body.repeat_last_n = 64;
+
+      const data = await this.fetchJSON(
+        `${url}/v1/chat/completions`,
+        body,
+        this.generateApiKey
+      );
 
       const result = data.choices[0].message.content as string;
       return this.parseExpandedQuery(result, query, includeLexical);
@@ -271,15 +444,22 @@ content ::= [^\\n]+
     options: RerankOptions = {}
   ): Promise<RerankResult> {
     if (documents.length === 0) {
-      return { results: [], model: "remote:" + this.rerankUrl };
+      return { results: [], model: this.rerankModel || "remote:" + this.rerankUrl };
     }
 
     try {
       const url = this.requireUrl(this.rerankUrl, "rerank");
-      const data = await this.fetchJSON(`${url}/v1/rerank`, {
+      const body: any = {
         query,
         documents: documents.map((d) => d.text),
-      });
+      };
+      if (this.rerankModel) body.model = this.rerankModel;
+
+      const data = await this.fetchJSON(
+        `${url}/v1/rerank`,
+        body,
+        this.rerankApiKey
+      );
 
       const results: RerankDocumentResult[] = (data.results as any[])
         .map((r: any) => ({
@@ -291,14 +471,17 @@ content ::= [^\\n]+
 
       return {
         results,
-        model: "remote:" + this.rerankUrl,
+        model: this.rerankModel || "remote:" + this.rerankUrl,
       };
     } catch (error) {
       console.error("Remote rerank error:", error);
-      // Return documents with zero scores on error
       return {
-        results: documents.map((d, i) => ({ file: d.file, score: 0, index: i })),
-        model: "remote:" + this.rerankUrl,
+        results: documents.map((d, i) => ({
+          file: d.file,
+          score: 0,
+          index: i,
+        })),
+        model: this.rerankModel || "remote:" + this.rerankUrl,
       };
     }
   }
@@ -308,8 +491,9 @@ content ::= [^\\n]+
   // ===========================================================================
 
   async modelExists(modelUri: string): Promise<ModelInfo> {
-    // For remote backends, check if the server is reachable
-    const urls = [this.embedUrl, this.generateUrl, this.rerankUrl].filter(Boolean);
+    const urls = [this.embedUrl, this.generateUrl, this.rerankUrl].filter(
+      Boolean
+    );
     for (const url of urls) {
       try {
         const resp = await fetch(`${url}/health`, { method: "GET" });
@@ -328,11 +512,10 @@ content ::= [^\\n]+
   // ===========================================================================
 
   async unloadIdleResources(): Promise<void> {
-    // No-op for remote backend - server manages its own resources
+    // No-op for remote backend
   }
 
   async dispose(): Promise<void> {
     this.disposed = true;
-    // No-op for remote backend - we don't own the server lifecycle
   }
 }

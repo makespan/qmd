@@ -480,8 +480,15 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
 | `QMD_EMBED_URL` | *(local)* | Remote embedding server URL (see [Remote Inference](#remote-inference-multi-user--docker)) |
+| `QMD_EMBED_API_KEY` | *(none)* | API key for embedding server (sent as `Bearer` token) |
+| `QMD_EMBED_MODEL` | *(none)* | Model name to send in embedding requests |
+| `QMD_EMBED_FORMAT` | `embeddinggemma` | `raw` to skip embeddinggemma prompt prefixes (use for OpenAI, etc.) |
 | `QMD_GENERATE_URL` | *(local)* | Remote query expansion server URL |
+| `QMD_GENERATE_API_KEY` | *(none)* | API key for generation server |
+| `QMD_GENERATE_MODEL` | *(none)* | Model name for generation requests |
 | `QMD_RERANK_URL` | *(local)* | Remote reranking server URL |
+| `QMD_RERANK_API_KEY` | *(none)* | API key for reranking server |
+| `QMD_RERANK_MODEL` | *(none)* | Model name for reranking requests |
 
 ## How It Works
 
@@ -635,13 +642,60 @@ export QMD_RERANK_URL=http://localhost:8083
 
 That's it — QMD will now call the remote servers instead of loading models locally. All commands (`embed`, `search`, `vsearch`, `query`) work identically.
 
+### Using OpenAI Embeddings
+
+You can use OpenAI (or any OpenAI-compatible API) for embeddings:
+
+```sh
+export QMD_EMBED_URL=https://api.openai.com
+export QMD_EMBED_API_KEY=sk-...
+export QMD_EMBED_MODEL=text-embedding-3-small
+export QMD_EMBED_FORMAT=raw
+```
+
+The `raw` format skips the embeddinggemma-specific prompt prefixes (`task: search result | query: ...`) which are meaningless for other models.
+
+This also works with other providers:
+
+```sh
+# Ollama
+export QMD_EMBED_URL=http://localhost:11434
+export QMD_EMBED_MODEL=nomic-embed-text
+export QMD_EMBED_FORMAT=raw
+
+# Together AI
+export QMD_EMBED_URL=https://api.together.xyz
+export QMD_EMBED_API_KEY=...
+export QMD_EMBED_MODEL=togethercomputer/m2-bert-80M-8k-retrieval
+export QMD_EMBED_FORMAT=raw
+```
+
+> **Note:** Changing embedding models invalidates existing embeddings. Run `qmd embed` to re-embed after switching. Different models produce different dimensions and vector spaces — you can't mix embeddings from different models.
+
+You can mix providers — e.g., OpenAI for embeddings but local models for query expansion and reranking:
+
+```sh
+export QMD_EMBED_URL=https://api.openai.com
+export QMD_EMBED_API_KEY=sk-...
+export QMD_EMBED_MODEL=text-embedding-3-small
+export QMD_EMBED_FORMAT=raw
+# QMD_GENERATE_URL and QMD_RERANK_URL not set → uses local models
+```
+
 ### Environment Variables
 
 | Variable | Description |
 |---|---|
-| `QMD_EMBED_URL` | URL of llama.cpp server loaded with the embedding model |
-| `QMD_GENERATE_URL` | URL of llama.cpp server loaded with the query expansion model |
-| `QMD_RERANK_URL` | URL of llama.cpp server loaded with the reranking model |
+| `QMD_EMBED_URL` | Embedding server URL |
+| `QMD_EMBED_API_KEY` | API key (sent as `Authorization: Bearer <key>`) |
+| `QMD_EMBED_MODEL` | Model name (e.g., `text-embedding-3-small`) |
+| `QMD_EMBED_FORMAT` | `embeddinggemma` (default) or `raw` |
+| `QMD_GENERATE_URL` | Query expansion server URL |
+| `QMD_GENERATE_API_KEY` | API key for generation |
+| `QMD_GENERATE_MODEL` | Model name for generation |
+| `QMD_RERANK_URL` | Reranking server URL |
+| `QMD_RERANK_API_KEY` | API key for reranking |
+| `QMD_RERANK_MODEL` | Model name for reranking |
 
 Set any combination — only the configured capabilities use remote inference. For example, setting only `QMD_EMBED_URL` uses remote embeddings but local reranking and query expansion.
 
@@ -691,13 +745,17 @@ services:
 
 ### API Compatibility
 
-The remote backend uses standard llama.cpp server endpoints:
-- `POST /v1/embeddings` — OpenAI-compatible embeddings
-- `POST /v1/chat/completions` — Chat completions with GBNF grammar support
-- `POST /v1/rerank` — Jina/Cohere-compatible reranking
-- `POST /tokenize` / `POST /detokenize` — Token operations
+The remote backend uses standard endpoints:
 
-Any server implementing these endpoints (vLLM, Ollama, etc.) should work.
+| Endpoint | Used for | Required by |
+|---|---|---|
+| `POST /v1/embeddings` | Embeddings | All providers |
+| `POST /v1/chat/completions` | Query expansion | Generation server |
+| `POST /v1/rerank` | Reranking | Reranking server |
+| `POST /tokenize` | Document chunking | Optional (llama.cpp only) |
+| `POST /detokenize` | Document chunking | Optional (llama.cpp only) |
+
+When `/tokenize` is unavailable (OpenAI, Ollama, etc.), QMD falls back to character-based chunking (~4 chars/token approximation). This is good enough for practical use.
 
 ## License
 

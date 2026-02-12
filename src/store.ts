@@ -1264,6 +1264,9 @@ export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHA
 /**
  * Chunk a document by actual token count using the LLM tokenizer.
  * More accurate than character-based chunking but requires async.
+ *
+ * When the LLM engine lacks a native tokenizer (e.g., OpenAI remote backend),
+ * falls back to character-based chunking using an approximate chars-per-token ratio.
  */
 export async function chunkDocumentByTokens(
   content: string,
@@ -1271,6 +1274,11 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
+
+  // If the engine doesn't have a real tokenizer, use character-based chunking
+  if (!llm.hasNativeTokenizer) {
+    return chunkDocumentByCharacters(content, maxTokens, overlapTokens);
+  }
 
   // Tokenize once upfront
   const allTokens = await llm.tokenize(content);
@@ -1292,35 +1300,7 @@ export async function chunkDocumentByTokens(
 
     // Find a good break point if not at end of document
     if (chunkEnd < totalTokens) {
-      const searchStart = Math.floor(chunkText.length * 0.7);
-      const searchSlice = chunkText.slice(searchStart);
-
-      let breakOffset = -1;
-      const paragraphBreak = searchSlice.lastIndexOf('\n\n');
-      if (paragraphBreak >= 0) {
-        breakOffset = paragraphBreak + 2;
-      } else {
-        const sentenceEnd = Math.max(
-          searchSlice.lastIndexOf('. '),
-          searchSlice.lastIndexOf('.\n'),
-          searchSlice.lastIndexOf('? '),
-          searchSlice.lastIndexOf('?\n'),
-          searchSlice.lastIndexOf('! '),
-          searchSlice.lastIndexOf('!\n')
-        );
-        if (sentenceEnd >= 0) {
-          breakOffset = sentenceEnd + 2;
-        } else {
-          const lineBreak = searchSlice.lastIndexOf('\n');
-          if (lineBreak >= 0) {
-            breakOffset = lineBreak + 1;
-          }
-        }
-      }
-
-      if (breakOffset >= 0) {
-        chunkText = chunkText.slice(0, searchStart + breakOffset);
-      }
+      chunkText = breakAtNaturalBoundary(chunkText);
     }
 
     // Approximate character position based on token position
@@ -1335,6 +1315,84 @@ export async function chunkDocumentByTokens(
   }
 
   return chunks;
+}
+
+/**
+ * Character-based chunking fallback for remote backends without tokenization.
+ * Uses ~4 characters per token as the approximation ratio.
+ */
+function chunkDocumentByCharacters(
+  content: string,
+  maxTokens: number,
+  overlapTokens: number
+): { text: string; pos: number; tokens: number }[] {
+  const CHARS_PER_TOKEN = 4;
+  const maxChars = maxTokens * CHARS_PER_TOKEN;
+  const overlapChars = overlapTokens * CHARS_PER_TOKEN;
+  const totalTokens = Math.ceil(content.length / CHARS_PER_TOKEN);
+
+  if (content.length <= maxChars) {
+    return [{ text: content, pos: 0, tokens: totalTokens }];
+  }
+
+  const chunks: { text: string; pos: number; tokens: number }[] = [];
+  const step = maxChars - overlapChars;
+  let charPos = 0;
+
+  while (charPos < content.length) {
+    const chunkEnd = Math.min(charPos + maxChars, content.length);
+    let chunkText = content.slice(charPos, chunkEnd);
+
+    // Find a good break point if not at end of document
+    if (chunkEnd < content.length) {
+      chunkText = breakAtNaturalBoundary(chunkText);
+    }
+
+    const tokens = Math.ceil(chunkText.length / CHARS_PER_TOKEN);
+    chunks.push({ text: chunkText, pos: charPos, tokens });
+
+    if (chunkEnd >= content.length) break;
+    charPos += step;
+  }
+
+  return chunks;
+}
+
+/**
+ * Try to break text at a natural boundary (paragraph, sentence, or line).
+ * Searches the last 30% of the text for a good break point.
+ */
+function breakAtNaturalBoundary(text: string): string {
+  const searchStart = Math.floor(text.length * 0.7);
+  const searchSlice = text.slice(searchStart);
+
+  let breakOffset = -1;
+  const paragraphBreak = searchSlice.lastIndexOf('\n\n');
+  if (paragraphBreak >= 0) {
+    breakOffset = paragraphBreak + 2;
+  } else {
+    const sentenceEnd = Math.max(
+      searchSlice.lastIndexOf('. '),
+      searchSlice.lastIndexOf('.\n'),
+      searchSlice.lastIndexOf('? '),
+      searchSlice.lastIndexOf('?\n'),
+      searchSlice.lastIndexOf('! '),
+      searchSlice.lastIndexOf('!\n')
+    );
+    if (sentenceEnd >= 0) {
+      breakOffset = sentenceEnd + 2;
+    } else {
+      const lineBreak = searchSlice.lastIndexOf('\n');
+      if (lineBreak >= 0) {
+        breakOffset = lineBreak + 1;
+      }
+    }
+  }
+
+  if (breakOffset >= 0) {
+    return text.slice(0, searchStart + breakOffset);
+  }
+  return text;
 }
 
 // =============================================================================
